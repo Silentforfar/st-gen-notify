@@ -1,0 +1,9 @@
+{
+	"name": "st-gen-notify",
+	"display_name": "生成完成通知",
+	"description": "AI 消息生成完毕或失败时，通过本机通知服务弹出 macOS 系统通知；失败时可点击通知查看完整错误详情（状态码、错误码、原因、后端日志）；支持自定义完成音效并调节音量。",
+	"author": "zhd",
+	"version": "3.3.0",
+	"loading_order": 50,
+	"js": "index.js"
+}
