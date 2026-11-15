@@ -12,7 +12,7 @@ import { eventSource, event_types, saveSettingsDebounced } from '../../../../scr
 import { extension_settings } from '../../../extensions.js';
 
 const TAG = '[生成通知]';
-const VERSION = 'v3.3.1-2026-11-15';
+const VERSION = 'v3.3.2-2026-11-15';
 
 // =====================================================================
 // 一、生成通知（原逻辑，未改动）
@@ -311,7 +311,7 @@ function updateSoundUI() {
 // ---------- 面板 ----------
 
 const SOUND_CSS = `
-#stgn-sound{margin-bottom:10px;color:inherit}
+#stgn-sound{margin-bottom:5px;color:inherit}
 #stgn-sound.inline-drawer > .inline-drawer-toggle.inline-drawer-header{margin-bottom:0}
 #stgn-sound > .inline-drawer-content{padding-top:5px}
 #stgn-sound .inline-drawer-content{display:none;padding-bottom:8px}
