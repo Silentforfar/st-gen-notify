@@ -12,7 +12,7 @@ import { eventSource, event_types, saveSettingsDebounced } from '../../../../scr
 import { extension_settings } from '../../../extensions.js';
 
 const TAG = '[生成通知]';
-const VERSION = 'v3.2-sound-2026-11-05';
+const VERSION = 'v3.3.1-2026-11-15';
 
 // =====================================================================
 // 一、生成通知（原逻辑，未改动）
@@ -312,8 +312,11 @@ function updateSoundUI() {
 
 const SOUND_CSS = `
 #stgn-sound{margin-bottom:10px;color:inherit}
+#stgn-sound.inline-drawer > .inline-drawer-toggle.inline-drawer-header{margin-bottom:0}
+#stgn-sound > .inline-drawer-content{padding-top:5px}
 #stgn-sound .inline-drawer-content{display:none;padding-bottom:8px}
-#stgn-sound .stgn-head{display:flex;align-items:baseline;gap:8px;font-size:14px}
+#stgn-sound .stgn-head{display:flex;align-items:baseline;gap:8px}
+#stgn-sound .stgn-head b{font-size:inherit;font-weight:700}
 #stgn-sound .stgn-cur{font-size:11.5px;opacity:.55;font-weight:400}
 #stgn-sound .stgn-row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
 #stgn-sound button,
