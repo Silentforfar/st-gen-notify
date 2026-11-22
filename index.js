@@ -12,7 +12,7 @@ import { eventSource, event_types, saveSettingsDebounced } from '../../../../scr
 import { extension_settings } from '../../../extensions.js';
 
 const TAG = '[生成通知]';
-const VERSION = 'v3.3.2-2026-11-15';
+const VERSION = 'v3.4.0-2026-11-23';
 
 // =====================================================================
 // 一、生成通知（原逻辑，未改动）
@@ -46,6 +46,7 @@ const state = {
 	running: false,
 	stopped: false,
 	failed: false,
+	failSoundPlayed: false,
 	httpStatus: 0,
 	startLen: 0,
 };
@@ -85,6 +86,8 @@ window.fetch = async function (...args) {
 			// 读不到就算了
 		}
 		state.failed = true;
+		// 注意：不能在这里发声。如果连接监视器的重试包装在更内层，这里的 !ok 会被
+		// 重试链中的每一次失败触发，连响好几声。改为等 GENERATION_ENDED（酒馆真正结束）再响一次。
 		sendNotify({
 			status: 'fail',
 			code: response.status,
@@ -103,6 +106,7 @@ eventSource.on(event_types.GENERATION_STARTED, () => {
 	state.running = true;
 	state.stopped = false;
 	state.failed = false;
+	state.failSoundPlayed = false;
 	state.httpStatus = 0;
 	try {
 		const chat = globalThis.SillyTavern?.getContext?.()?.chat || [];
@@ -126,8 +130,12 @@ eventSource.on(event_types.GENERATION_ENDED, () => {
 	if (state.stopped) {
 		return;
 	}
-	// 失败已在 fetch 层通知过，避免重复
+	// 失败已在 fetch 层通知过，避免重复；但失败音效要在这里补一声（整个生成真正结束了）
 	if (state.failed) {
+		if (!state.failSoundPlayed) {
+			state.failSoundPlayed = true;
+			playFailSound();
+		}
 		return;
 	}
 
@@ -148,6 +156,52 @@ eventSource.on(event_types.GENERATION_ENDED, () => {
 });
 
 // =====================================================================
+// 一·五、失败音效
+// =====================================================================
+// 完成音效靠替换酒馆的 #audio_message_sound 实现，但酒馆在失败时根本不播那个音，
+// 所以失败要自己发声：内置的「下降音」用 WebAudio 现场合成，不需要额外音频文件。
+let failAudioCtx = null;
+
+function synthFailTone(volume) {
+	try {
+		const AC = window.AudioContext || window.webkitAudioContext;
+		if (!AC) { return; }
+		failAudioCtx = failAudioCtx || new AC();
+		const ctx = failAudioCtx;
+		if (ctx.state === 'suspended') { ctx.resume().catch(() => {}); }
+		const t0 = ctx.currentTime + 0.01;
+		const osc = ctx.createOscillator();
+		const gain = ctx.createGain();
+		osc.type = 'triangle';
+		// 700Hz 滑到 330Hz：听感是「往下沉」的提示，不会和完成音效混淆
+		osc.frequency.setValueAtTime(700, t0);
+		osc.frequency.exponentialRampToValueAtTime(330, t0 + 0.26);
+		gain.gain.setValueAtTime(0.0001, t0);
+		gain.gain.exponentialRampToValueAtTime(Math.max(0.03, volume * 0.45), t0 + 0.03);
+		gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.36);
+		osc.connect(gain);
+		gain.connect(ctx.destination);
+		osc.start(t0);
+		osc.stop(t0 + 0.38);
+	} catch { /* 音频不可用就静默 */ }
+}
+
+function playFailSound(override) {
+	const s = getSoundSettings();
+	const choice = override || s.failSound || 'builtin';
+	if (choice === 'off') { return; }
+	if (choice === 'builtin') {
+		synthFailTone(typeof s.volume === 'number' ? s.volume : 0.8);
+		return;
+	}
+	if (!PRESETS.some((p) => p.id === choice)) { return; }
+	try {
+		const a = new Audio(presetUrl(choice));
+		a.volume = typeof s.volume === 'number' ? s.volume : 0.8;
+		a.play().catch(() => { /* 自动播放被拦就静默 */ });
+	} catch { /* ignore */ }
+}
+
 // 二、自定义完成音效
 // =====================================================================
 
@@ -219,6 +273,9 @@ function getSoundSettings() {
 	}
 	if (typeof s.presetId !== 'string') {
 		s.presetId = '';             // '' = 内置「叮」；'custom' = 自定义上传；其他 = 预置音效 id
+	}
+	if (typeof s.failSound !== 'string') {
+		s.failSound = 'builtin';     // 'off' = 关闭；'builtin' = 合成下降音；其他 = 预置音效 id
 	}
 	return s;
 }
@@ -318,6 +375,9 @@ const SOUND_CSS = `
 #stgn-sound .stgn-head{display:flex;align-items:baseline;gap:8px}
 #stgn-sound .stgn-head b{font-size:inherit;font-weight:700}
 #stgn-sound .stgn-cur{font-size:11.5px;opacity:.55;font-weight:400}
+#stgn-sound .stgn-failselect{flex:1;min-width:0;padding:3px 6px;border-radius:6px;
+ background:color-mix(in srgb,var(--SmartThemeBodyColor,#fff) 10%,transparent);
+ color:inherit;border:1px solid var(--SmartThemeBorderColor,rgba(255,255,255,.15));font-size:12.5px}
 #stgn-sound .stgn-row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
 #stgn-sound button,
 #stgn-sound .stgn-pick{
@@ -376,7 +436,16 @@ function buildSoundPanel() {
 		<button type="button" class="stgn-chip" data-preset="">内置「叮」</button>
 		${PRESETS.map((p) => `<button type="button" class="stgn-chip" data-preset="${p.id}">${p.label}</button>`).join('')}
 	</div>
-	<div class="stgn-grplabel">自定义音频</div>
+	<div class="stgn-grplabel">失败音效（生成失败时播放）</div>
+	<div class="stgn-row">
+		<select class="stgn-failselect">
+			<option value="off">关闭</option>
+			<option value="builtin">内置提示音（下降音）</option>
+			${PRESETS.map((p) => `<option value="${p.id}">${p.label}</option>`).join('')}
+		</select>
+		<button class="stgn-failtest" type="button">试听</button>
+	</div>
+	<div class="stgn-grplabel">自定义音频（完成音效）</div>
 	<div class="stgn-row">
 		<label class="stgn-pick">选择音频<input type="file" accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac" hidden></label>
 		<button class="stgn-test" type="button">试听</button>
@@ -407,6 +476,23 @@ function buildSoundPanel() {
 			} catch { /* ignore */ }
 		});
 	});
+
+	const failSelect = el.querySelector('.stgn-failselect');
+	const failTest = el.querySelector('.stgn-failtest');
+	function syncFailSelect() {
+		const s = getSoundSettings();
+		if (failSelect) { failSelect.value = s.failSound || 'builtin'; }
+	}
+	syncFailSelect();
+	if (failSelect) {
+		failSelect.addEventListener('change', () => {
+			getSoundSettings().failSound = failSelect.value;
+			saveSettingsDebounced();
+		});
+	}
+	if (failTest) {
+		failTest.addEventListener('click', () => { playFailSound(failSelect ? failSelect.value : undefined); });
+	}
 
 	const fileInput = el.querySelector('input[type=file]');
 
