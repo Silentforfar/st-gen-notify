@@ -12,7 +12,7 @@ import { eventSource, event_types, saveSettingsDebounced } from '../../../../scr
 import { extension_settings } from '../../../extensions.js';
 
 const TAG = '[生成通知]';
-const VERSION = 'v3.4.0-2026-11-23';
+const VERSION = 'v3.5.0-2026-11-28';
 
 // =====================================================================
 // 一、生成通知（原逻辑，未改动）
@@ -152,6 +152,8 @@ eventSource.on(event_types.GENERATION_ENDED, () => {
 
 	if (produced) {
 		sendNotify({ status: 'ok' });
+		// 页面有焦点时酒馆通常会跳过完成音效（play_sound_unfocused），这里按设置补一声
+		playCompletionWhenFocused();
 	}
 });
 
@@ -209,6 +211,9 @@ const IDB_NAME = 'st-gen-notify';
 const IDB_STORE = 'files';
 const MAX_BYTES = 4 * 1024 * 1024;   // 4MB 上限，够放几十秒音频
 const DEFAULT_SOUND = new URL('sounds/message.mp3', document.baseURI).href;
+
+// 最近一次 #audio_message_sound 真正开始播放的时刻，用于避免「酒馆播了、我们又补一声」
+let lastSoundPlayAt = 0;
 
 // ---------- 预置音效（Mixkit 免费授权，随扩展分发在 sounds/ 目录） ----------
 const PRESETS = [
@@ -277,6 +282,9 @@ function getSoundSettings() {
 	if (typeof s.failSound !== 'string') {
 		s.failSound = 'builtin';     // 'off' = 关闭；'builtin' = 合成下降音；其他 = 预置音效 id
 	}
+	if (typeof s.soundWhenFocused !== 'boolean') {
+		s.soundWhenFocused = false;  // 页面有焦点时也补播完成音效（覆盖酒馆的「仅失焦播放」）
+	}
 	return s;
 }
 
@@ -294,6 +302,7 @@ function hookVolume() {
 		try {
 			audio.volume = getSoundSettings().volume;
 		} catch { /* ignore */ }
+		lastSoundPlayAt = performance.now();
 	});
 }
 
@@ -336,6 +345,43 @@ async function applySound() {
 	updateSoundUI();
 }
 
+/**
+ * 酒馆的 playMessageSound() 里有这一句：
+ *     if (power_user.play_sound_unfocused && browser_has_focus && !force) return;
+ * 于是「仅当标签页不活跃时播放」开着时，你正看着酒馆页面就完全听不到完成音。
+ * 这个函数在那种情况下补播一声；只在酒馆确实跳过时才补，避免重复响。
+ */
+function playCompletionWhenFocused() {
+	const s = getSoundSettings();
+	if (!s.soundWhenFocused) { return; }
+	if (!document.hasFocus()) { return; }   // 失焦时酒馆自己会播，不用插手
+
+	// 酒馆会不会播？它只在「仅失焦播放」开着 + 有焦点时才跳过。
+	// 注意：酒馆通过 getContext() 暴露的是 powerUserSettings（不是 power_user）
+	let skippedByFocus = true;
+	try {
+		const c = globalThis.SillyTavern?.getContext?.();
+		const pu = c?.powerUserSettings || c?.power_user || globalThis.power_user;
+		if (pu && pu.play_sound_unfocused === false) { skippedByFocus = false; }
+	} catch { /* 读不到就按「酒馆会跳过」处理，宁可补一声也别不出声 */ }
+	if (!skippedByFocus) { return; }
+
+	// playMessageSound() 在 GENERATION_ENDED 之后才调用（onFinishStreaming 的末尾），
+	// 所以稍等一下再决定：这期间酒馆若自己播了，lastSoundPlayAt 会更新，我们就不响，
+	// 避免「酒馆一声 + 我们一声」的双响。
+	setTimeout(() => {
+		if (performance.now() - lastSoundPlayAt < 300) { return; }
+		const audio = soundAudio();
+		if (!audio || !audio.getAttribute('src')) { return; }
+		try {
+			audio.volume = typeof s.volume === 'number' ? s.volume : 0.8;
+			audio.currentTime = 0;
+			const pr = audio.play();
+			if (pr && typeof pr.catch === 'function') { pr.catch(() => { /* 自动播放被拦就静默 */ }); }
+		} catch { /* ignore */ }
+	}, 120);
+}
+
 function fmtSize(n) {
 	if (n < 1024) { return `${n} B`; }
 	if (n < 1024 * 1024) { return `${(n / 1024).toFixed(0)} KB`; }
@@ -355,6 +401,8 @@ function updateSoundUI() {
 			cur.textContent = '内置「叮」';
 		}
 	}
+	const wf = document.querySelector('#stgn-sound .stgn-whenfocused');
+	if (wf) { wf.checked = !!s.soundWhenFocused; }
 	const vol = document.querySelector('#stgn-sound .stgn-vol');
 	const volVal = document.querySelector('#stgn-sound .stgn-volval');
 	if (vol) { vol.value = String(s.volume); }
@@ -405,6 +453,7 @@ const SOUND_CSS = `
 	font-weight:600;
 }
 #stgn-sound .stgn-grplabel{font-size:11.5px;opacity:.6;margin:6px 0 2px}
+#stgn-sound .stgn-toggle{display:flex;align-items:center;gap:7px;margin:2px 0 4px;font-size:12.5px;opacity:.9;cursor:pointer}
 `;
 
 function buildSoundPanel() {
@@ -436,6 +485,8 @@ function buildSoundPanel() {
 		<button type="button" class="stgn-chip" data-preset="">内置「叮」</button>
 		${PRESETS.map((p) => `<button type="button" class="stgn-chip" data-preset="${p.id}">${p.label}</button>`).join('')}
 	</div>
+	<div class="stgn-grplabel">完成音效</div>
+	<label class="stgn-toggle"><input type="checkbox" class="stgn-whenfocused"> 有焦点时也播放（覆盖酒馆的「仅失焦播放」）</label>
 	<div class="stgn-grplabel">失败音效（生成失败时播放）</div>
 	<div class="stgn-row">
 		<select class="stgn-failselect">
@@ -476,6 +527,18 @@ function buildSoundPanel() {
 			} catch { /* ignore */ }
 		});
 	});
+
+	const whenFocused = el.querySelector('.stgn-whenfocused');
+	function syncWhenFocused() {
+		if (whenFocused) { whenFocused.checked = !!getSoundSettings().soundWhenFocused; }
+	}
+	syncWhenFocused();
+	if (whenFocused) {
+		whenFocused.addEventListener('change', () => {
+			getSoundSettings().soundWhenFocused = whenFocused.checked;
+			saveSettingsDebounced();
+		});
+	}
 
 	const failSelect = el.querySelector('.stgn-failselect');
 	const failTest = el.querySelector('.stgn-failtest');
