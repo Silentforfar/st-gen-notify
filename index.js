@@ -12,7 +12,7 @@ import { eventSource, event_types, saveSettingsDebounced } from '../../../../scr
 import { extension_settings } from '../../../extensions.js';
 
 const TAG = '[生成通知]';
-const VERSION = 'v3.5.0-2026-11-28';
+const VERSION = 'v3.6.0-2026-11-28';
 
 // =====================================================================
 // 一、生成通知（原逻辑，未改动）
@@ -152,8 +152,6 @@ eventSource.on(event_types.GENERATION_ENDED, () => {
 
 	if (produced) {
 		sendNotify({ status: 'ok' });
-		// 页面有焦点时酒馆通常会跳过完成音效（play_sound_unfocused），这里按设置补一声
-		playCompletionWhenFocused();
 	}
 });
 
@@ -211,9 +209,6 @@ const IDB_NAME = 'st-gen-notify';
 const IDB_STORE = 'files';
 const MAX_BYTES = 4 * 1024 * 1024;   // 4MB 上限，够放几十秒音频
 const DEFAULT_SOUND = new URL('sounds/message.mp3', document.baseURI).href;
-
-// 最近一次 #audio_message_sound 真正开始播放的时刻，用于避免「酒馆播了、我们又补一声」
-let lastSoundPlayAt = 0;
 
 // ---------- 预置音效（Mixkit 免费授权，随扩展分发在 sounds/ 目录） ----------
 const PRESETS = [
@@ -282,10 +277,73 @@ function getSoundSettings() {
 	if (typeof s.failSound !== 'string') {
 		s.failSound = 'builtin';     // 'off' = 关闭；'builtin' = 合成下降音；其他 = 预置音效 id
 	}
-	if (typeof s.soundWhenFocused !== 'boolean') {
-		s.soundWhenFocused = false;  // 页面有焦点时也补播完成音效（覆盖酒馆的「仅失焦播放」）
-	}
 	return s;
+}
+
+// ---------- 与酒馆原生「仅当标签页不活跃时播放」联动 ----------
+// 酒馆 playMessageSound(): if (play_sound_unfocused && browser_has_focus && !force) return;
+// 本插件不自己发声，只提供一个「始终播放」的入口，直接改写酒馆的这项设置，
+// 这样播放时机永远由酒馆统一管理，不会出现双响或漏响。
+const NATIVE_UNFOCUSED_ID = 'play_sound_unfocused';
+
+function isPlayUnfocused() {
+	try {
+		const pu = globalThis.SillyTavern?.getContext?.()?.powerUserSettings;
+		if (pu) { return pu.play_sound_unfocused !== false; }
+	} catch { /* ignore */ }
+	return true;   // 读不到就按酒馆默认值处理
+}
+
+function setPlayUnfocused(value) {
+	try {
+		const c = globalThis.SillyTavern?.getContext?.();
+		const pu = c?.powerUserSettings;
+		if (!pu) { return false; }
+		pu.play_sound_unfocused = !!value;
+		const native = document.getElementById(NATIVE_UNFOCUSED_ID);
+		if (native instanceof HTMLInputElement && native.checked !== !!value) {
+			native.checked = !!value;
+		}
+		if (typeof c.saveSettingsDebounced === 'function') { c.saveSettingsDebounced(); }
+		return true;
+	} catch (err) {
+		console.warn(TAG, '更新酒馆音效设置失败:', err);
+		return false;
+	}
+}
+
+/** 把插件里的「始终播放」勾选状态与酒馆设置对齐 */
+function syncAlwaysPlayCheckbox() {
+	const cb = document.querySelector('#stgn-sound .stgn-whenfocused');
+	if (cb) { cb.checked = !isPlayUnfocused(); }
+	refreshSoundOffHint();
+}
+
+/** 酒馆还有个总开关 play_message_sound；它关着的话，插件的「始终播放」也不会有声 */
+function refreshSoundOffHint() {
+	const hint = document.querySelector('#stgn-sound .stgn-soundoff');
+	if (!hint) { return; }
+	let enabled = true;
+	try {
+		const pu = globalThis.SillyTavern?.getContext?.()?.powerUserSettings;
+		if (pu) { enabled = !!pu.play_message_sound; }
+	} catch { /* 读不到就不提示 */ }
+	hint.style.display = enabled ? 'none' : 'block';
+}
+
+/** 与酒馆原生复选框双向联动（它们可能后渲染，重复调用安全） */
+function bindNativeSoundCheckbox() {
+	const native = document.getElementById(NATIVE_UNFOCUSED_ID);
+	if (native instanceof HTMLInputElement && !native.dataset.stgnLinked) {
+		native.dataset.stgnLinked = '1';
+		native.addEventListener('input', syncAlwaysPlayCheckbox);
+	}
+	// 酒馆的音效总开关：关掉时插件也发不出声，跟着提示
+	const pms = document.getElementById('play_message_sound');
+	if (pms instanceof HTMLInputElement && !pms.dataset.stgnLinked) {
+		pms.dataset.stgnLinked = '1';
+		pms.addEventListener('input', refreshSoundOffHint);
+	}
 }
 
 function soundAudio() {
@@ -302,7 +360,6 @@ function hookVolume() {
 		try {
 			audio.volume = getSoundSettings().volume;
 		} catch { /* ignore */ }
-		lastSoundPlayAt = performance.now();
 	});
 }
 
@@ -345,43 +402,6 @@ async function applySound() {
 	updateSoundUI();
 }
 
-/**
- * 酒馆的 playMessageSound() 里有这一句：
- *     if (power_user.play_sound_unfocused && browser_has_focus && !force) return;
- * 于是「仅当标签页不活跃时播放」开着时，你正看着酒馆页面就完全听不到完成音。
- * 这个函数在那种情况下补播一声；只在酒馆确实跳过时才补，避免重复响。
- */
-function playCompletionWhenFocused() {
-	const s = getSoundSettings();
-	if (!s.soundWhenFocused) { return; }
-	if (!document.hasFocus()) { return; }   // 失焦时酒馆自己会播，不用插手
-
-	// 酒馆会不会播？它只在「仅失焦播放」开着 + 有焦点时才跳过。
-	// 注意：酒馆通过 getContext() 暴露的是 powerUserSettings（不是 power_user）
-	let skippedByFocus = true;
-	try {
-		const c = globalThis.SillyTavern?.getContext?.();
-		const pu = c?.powerUserSettings || c?.power_user || globalThis.power_user;
-		if (pu && pu.play_sound_unfocused === false) { skippedByFocus = false; }
-	} catch { /* 读不到就按「酒馆会跳过」处理，宁可补一声也别不出声 */ }
-	if (!skippedByFocus) { return; }
-
-	// playMessageSound() 在 GENERATION_ENDED 之后才调用（onFinishStreaming 的末尾），
-	// 所以稍等一下再决定：这期间酒馆若自己播了，lastSoundPlayAt 会更新，我们就不响，
-	// 避免「酒馆一声 + 我们一声」的双响。
-	setTimeout(() => {
-		if (performance.now() - lastSoundPlayAt < 300) { return; }
-		const audio = soundAudio();
-		if (!audio || !audio.getAttribute('src')) { return; }
-		try {
-			audio.volume = typeof s.volume === 'number' ? s.volume : 0.8;
-			audio.currentTime = 0;
-			const pr = audio.play();
-			if (pr && typeof pr.catch === 'function') { pr.catch(() => { /* 自动播放被拦就静默 */ }); }
-		} catch { /* ignore */ }
-	}, 120);
-}
-
 function fmtSize(n) {
 	if (n < 1024) { return `${n} B`; }
 	if (n < 1024 * 1024) { return `${(n / 1024).toFixed(0)} KB`; }
@@ -401,8 +421,7 @@ function updateSoundUI() {
 			cur.textContent = '内置「叮」';
 		}
 	}
-	const wf = document.querySelector('#stgn-sound .stgn-whenfocused');
-	if (wf) { wf.checked = !!s.soundWhenFocused; }
+	syncAlwaysPlayCheckbox();
 	const vol = document.querySelector('#stgn-sound .stgn-vol');
 	const volVal = document.querySelector('#stgn-sound .stgn-volval');
 	if (vol) { vol.value = String(s.volume); }
@@ -454,6 +473,8 @@ const SOUND_CSS = `
 }
 #stgn-sound .stgn-grplabel{font-size:11.5px;opacity:.6;margin:6px 0 2px}
 #stgn-sound .stgn-toggle{display:flex;align-items:center;gap:7px;margin:2px 0 4px;font-size:12.5px;opacity:.9;cursor:pointer}
+#stgn-sound .stgn-soundoff{display:none;margin:2px 0 6px;padding:6px 8px;border-radius:6px;font-size:11.5px;line-height:1.5;
+ background:color-mix(in srgb,#f5a623 16%,transparent);border:1px solid color-mix(in srgb,#f5a623 40%,transparent)}
 `;
 
 function buildSoundPanel() {
@@ -486,7 +507,8 @@ function buildSoundPanel() {
 		${PRESETS.map((p) => `<button type="button" class="stgn-chip" data-preset="${p.id}">${p.label}</button>`).join('')}
 	</div>
 	<div class="stgn-grplabel">完成音效</div>
-	<label class="stgn-toggle"><input type="checkbox" class="stgn-whenfocused"> 有焦点时也播放（覆盖酒馆的「仅失焦播放」）</label>
+	<label class="stgn-toggle"><input type="checkbox" class="stgn-whenfocused"> 始终播放（与酒馆「仅当标签页不活跃时播放」联动）</label>
+	<div class="stgn-soundoff">注意：酒馆「用户设置 → 音效 → 启用消息音效」当前是关闭的，需先打开，否则不会有声音。</div>
 	<div class="stgn-grplabel">失败音效（生成失败时播放）</div>
 	<div class="stgn-row">
 		<select class="stgn-failselect">
@@ -528,15 +550,23 @@ function buildSoundPanel() {
 		});
 	});
 
-	const whenFocused = el.querySelector('.stgn-whenfocused');
-	function syncWhenFocused() {
-		if (whenFocused) { whenFocused.checked = !!getSoundSettings().soundWhenFocused; }
+	const alwaysPlay = el.querySelector('.stgn-whenfocused');
+	syncAlwaysPlayCheckbox();
+	bindNativeSoundCheckbox();
+	refreshSoundOffHint();
+	if (alwaysPlay) {
+		alwaysPlay.addEventListener('change', () => {
+			// 勾上「始终播放」= 关掉酒馆的「仅当标签页不活跃时播放」
+			const ok = setPlayUnfocused(!alwaysPlay.checked);
+			if (!ok) { alwaysPlay.checked = !isPlayUnfocused(); }   // 写不进去就回滚到真实状态
+		});
 	}
-	syncWhenFocused();
-	if (whenFocused) {
-		whenFocused.addEventListener('change', () => {
-			getSoundSettings().soundWhenFocused = whenFocused.checked;
-			saveSettingsDebounced();
+	// 每次展开面板时对齐一次（用户可能在酒馆原生设置里改过）
+	const header = el.querySelector('.inline-drawer-toggle');
+	if (header) {
+		header.addEventListener('click', () => {
+			bindNativeSoundCheckbox();
+			syncAlwaysPlayCheckbox();
 		});
 	}
 
